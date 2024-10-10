@@ -27,7 +27,7 @@ const (
 		lsn_offset BIGINT NOT NULL,sync_batch_id BIGINT NOT NULL,normalize_batch_id BIGINT NOT NULL)`
 	rawTablePrefix    = "_peerdb_raw"
 	createSchemaSQL   = "CREATE SCHEMA IF NOT EXISTS %s"
-	createRawTableSQL = `CREATE TABLE IF NOT EXISTS %s.%s(_peerdb_uid TEXT NOT NULL,
+	createRawTableSQL = `CREATE TABLE IF NOT EXISTS %s.%s(_peerdb_uid uuid NOT NULL,
 		_peerdb_timestamp BIGINT NOT NULL,_peerdb_destination_table_name TEXT NOT NULL,_peerdb_data JSONB NOT NULL,
 		_peerdb_record_type INTEGER NOT NULL, _peerdb_match_data JSONB,_peerdb_batch_id INTEGER,
 		_peerdb_unchanged_toast_columns TEXT)`
@@ -39,7 +39,7 @@ const (
 	getLastSyncBatchID_SQL      = "SELECT sync_batch_id FROM %s.%s WHERE mirror_job_name=$1"
 	getLastNormalizeBatchID_SQL = "SELECT normalize_batch_id FROM %s.%s WHERE mirror_job_name=$1"
 	createNormalizedTableSQL    = "CREATE TABLE IF NOT EXISTS %s(%s)"
-
+	checkTableExistsSQL         = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_tables WHERE schemaname = $1 AND tablename = $2)"
 	upsertJobMetadataForSyncSQL = `INSERT INTO %s.%s AS j VALUES ($1,$2,$3,$4)
 	 ON CONFLICT(mirror_job_name) DO UPDATE SET lsn_offset=GREATEST(j.lsn_offset, EXCLUDED.lsn_offset), sync_batch_id=EXCLUDED.sync_batch_id`
 	checkIfJobMetadataExistsSQL          = "SELECT COUNT(1)::TEXT::BOOL FROM %s.%s WHERE mirror_job_name=$1"
@@ -451,15 +451,14 @@ func getRawTableIdentifier(jobName string) string {
 }
 
 func generateCreateTableSQLForNormalizedTable(
-	sourceTableIdentifier string,
-	sourceTableSchema *protos.TableSchema,
-	softDeleteColName string,
-	syncedAtColName string,
+	config *protos.SetupNormalizedTableBatchInput,
+	dstSchemaTable *utils.SchemaTable,
+	tableSchema *protos.TableSchema,
 ) string {
-	createTableSQLArray := make([]string, 0, len(sourceTableSchema.Columns)+2)
-	for _, column := range sourceTableSchema.Columns {
+	createTableSQLArray := make([]string, 0, len(tableSchema.Columns)+2)
+	for _, column := range tableSchema.Columns {
 		pgColumnType := column.Type
-		if sourceTableSchema.System == protos.TypeSystem_Q {
+		if tableSchema.System == protos.TypeSystem_Q {
 			pgColumnType = qValueKindToPostgresType(pgColumnType)
 		}
 		if column.Type == "numeric" && column.TypeModifier != -1 {
@@ -467,7 +466,7 @@ func generateCreateTableSQLForNormalizedTable(
 			pgColumnType = fmt.Sprintf("numeric(%d,%d)", precision, scale)
 		}
 		var notNull string
-		if sourceTableSchema.NullableEnabled && !column.Nullable {
+		if tableSchema.NullableEnabled && !column.Nullable {
 			notNull = " NOT NULL"
 		}
 
@@ -475,27 +474,27 @@ func generateCreateTableSQLForNormalizedTable(
 			fmt.Sprintf("%s %s%s", QuoteIdentifier(column.Name), pgColumnType, notNull))
 	}
 
-	if softDeleteColName != "" {
+	if config.SoftDeleteColName != "" {
 		createTableSQLArray = append(createTableSQLArray,
-			QuoteIdentifier(softDeleteColName)+` BOOL DEFAULT FALSE`)
+			QuoteIdentifier(config.SoftDeleteColName)+` BOOL DEFAULT FALSE`)
 	}
 
-	if syncedAtColName != "" {
+	if config.SyncedAtColName != "" {
 		createTableSQLArray = append(createTableSQLArray,
-			QuoteIdentifier(syncedAtColName)+` TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+			QuoteIdentifier(config.SyncedAtColName)+` TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
 	}
 
 	// add composite primary key to the table
-	if len(sourceTableSchema.PrimaryKeyColumns) > 0 && !sourceTableSchema.IsReplicaIdentityFull {
-		primaryKeyColsQuoted := make([]string, 0, len(sourceTableSchema.PrimaryKeyColumns))
-		for _, primaryKeyCol := range sourceTableSchema.PrimaryKeyColumns {
+	if len(tableSchema.PrimaryKeyColumns) > 0 && !tableSchema.IsReplicaIdentityFull {
+		primaryKeyColsQuoted := make([]string, 0, len(tableSchema.PrimaryKeyColumns))
+		for _, primaryKeyCol := range tableSchema.PrimaryKeyColumns {
 			primaryKeyColsQuoted = append(primaryKeyColsQuoted, QuoteIdentifier(primaryKeyCol))
 		}
 		createTableSQLArray = append(createTableSQLArray, fmt.Sprintf("PRIMARY KEY(%s)",
 			strings.Join(primaryKeyColsQuoted, ",")))
 	}
 
-	return fmt.Sprintf(createNormalizedTableSQL, sourceTableIdentifier, strings.Join(createTableSQLArray, ","))
+	return fmt.Sprintf(createNormalizedTableSQL, dstSchemaTable.String(), strings.Join(createTableSQLArray, ","))
 }
 
 func (c *PostgresConnector) GetLastSyncBatchID(ctx context.Context, jobName string) (int64, error) {
@@ -642,6 +641,22 @@ func (c *PostgresConnector) getCurrentLSN(ctx context.Context) (pglogrepl.LSN, e
 
 func (c *PostgresConnector) getDefaultPublicationName(jobName string) string {
 	return "peerflow_pub_" + jobName
+}
+
+func (c *PostgresConnector) checkIfTableExistsWithTx(
+	ctx context.Context,
+	schemaName string,
+	tableName string,
+	tx pgx.Tx,
+) (bool, error) {
+	row := tx.QueryRow(ctx, checkTableExistsSQL, schemaName, tableName)
+	var result pgtype.Bool
+	err := row.Scan(&result)
+	if err != nil {
+		return false, fmt.Errorf("error while running query: %w", err)
+	}
+
+	return result.Bool, nil
 }
 
 func (c *PostgresConnector) ExecuteCommand(ctx context.Context, command string) error {

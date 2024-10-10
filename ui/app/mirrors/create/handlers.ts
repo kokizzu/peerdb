@@ -5,6 +5,9 @@ import {
   FlowConnectionConfigs,
   QRepConfig,
   QRepWriteType,
+  TableEngine,
+  TableMapping,
+  TypeSystem,
 } from '@/grpc_generated/flow';
 import { DBType, dBTypeToJSON } from '@/grpc_generated/peers';
 import {
@@ -15,7 +18,6 @@ import {
   PeerSchemasResponse,
   SchemaTablesResponse,
   TableColumnsResponse,
-  ValidateCDCMirrorResponse,
 } from '@/grpc_generated/route';
 import { Dispatch, SetStateAction } from 'react';
 
@@ -44,6 +46,13 @@ export function IsEventhubsPeer(peerType?: DBType): boolean {
   );
 }
 
+export const IsPostgresPeer = (peerType?: DBType): boolean => {
+  return (
+    (!!peerType && peerType === DBType.POSTGRES) ||
+    peerType?.toString() === DBType[DBType.POSTGRES]
+  );
+};
+
 function ValidSchemaQualifiedTarget(
   peerType: DBType,
   tableName: string
@@ -68,6 +77,14 @@ function CDCCheck(
     return flowNameValid.error.issues[0].message;
   }
 
+  if (config.envString) {
+    try {
+      JSON.parse(config.envString);
+    } catch (err: any) {
+      return err.message;
+    }
+  }
+
   const tableNameMapping = reformattedTableMapping(rows);
   const fieldErr = validateCDCFields(tableNameMapping, config, destinationType);
   if (fieldErr) {
@@ -87,6 +104,10 @@ function CDCCheck(
 
   if (config.doInitialSnapshot == true && config.replicationSlotName !== '') {
     config.replicationSlotName = '';
+  }
+
+  if (!IsPostgresPeer(destinationType)) {
+    config.system = TypeSystem.Q;
   }
 
   if (IsQueuePeer(destinationType)) {
@@ -152,23 +173,54 @@ function validateQRepFields(
   }
 }
 
-interface TableMapping {
-  sourceTableIdentifier: string;
-  destinationTableIdentifier: string;
-  partitionKey: string;
-  exclude: string[];
-}
 export function reformattedTableMapping(
   tableMapping: TableMapRow[]
 ): TableMapping[] {
-  const mapping = tableMapping
+  return tableMapping
     .filter((row) => row?.selected === true && row?.canMirror === true)
     .map((row) => ({
       sourceTableIdentifier: row.source,
       destinationTableIdentifier: row.destination,
       partitionKey: row.partitionKey,
       exclude: Array.from(row.exclude),
+      columns: row.columns,
+      engine: row.engine,
     }));
+}
+
+export function changesToTablesMapping(
+  tableMapping: TableMapRow[],
+  currentTableMapping: Map<string, TableMapping[]>,
+  isRemoval: boolean
+): TableMapping[] {
+  const mapping = tableMapping
+    .filter((row) => {
+      const isSelected = row?.selected === true && row?.canMirror === true;
+      const isCurrentMapping = currentTableMapping
+        .get(row.schema)
+        ?.map((tableMap) => tableMap.sourceTableIdentifier)
+        .includes(row.source);
+      // if not in current mapping, and selected, it's an addition
+      if (!isCurrentMapping && isSelected && !isRemoval) {
+        return true;
+      }
+      // if in current mapping, and not selected, it's a removal
+      if (isCurrentMapping && !isSelected && isRemoval) {
+        return true;
+      }
+      return false;
+    })
+    .map(
+      (row) =>
+        ({
+          sourceTableIdentifier: row.source,
+          destinationTableIdentifier: row.destination,
+          partitionKey: row.partitionKey,
+          exclude: Array.from(row.exclude),
+          columns: row.columns,
+          engine: row.engine,
+        }) as TableMapping
+    );
   return mapping;
 }
 
@@ -365,13 +417,14 @@ export async function fetchTables(
   peerName: string,
   schemaName: string,
   targetSchemaName: string,
-  peerType?: DBType
+  peerType?: DBType,
+  initialLoadOnly?: boolean
 ) {
   if (schemaName.length === 0) return [];
   const tablesRes: SchemaTablesResponse = await fetch(
     `/api/v1/peers/tables?peerName=${encodeURIComponent(
       peerName
-    )}&schema_name=${encodeURIComponent(schemaName)}`,
+    )}&schema_name=${encodeURIComponent(schemaName)}&cdc_enabled=${!initialLoadOnly}`,
     {
       cache: 'no-store',
     }
@@ -397,6 +450,9 @@ export async function fetchTables(
         selected: false,
         canMirror: tableObject.canMirror,
         tableSize: tableObject.tableSize,
+        editingDisabled: false,
+        columns: [],
+        engine: TableEngine.CH_ENGINE_REPLACING_MERGE_TREE,
       });
     }
   }
@@ -455,10 +511,7 @@ export async function handleValidateCDC(
     }),
   });
   if (statusRes.ok) {
-    const status: ValidateCDCMirrorResponse = await statusRes.json();
-    if (status.ok) {
-      notifyErr('CDC Mirror is valid', true);
-    }
+    notifyErr('CDC Mirror is valid', true);
   } else {
     const errRes = await statusRes.json();
     notifyErr('CDC Mirror is invalid: ' + errRes.message);

@@ -96,7 +96,7 @@ var QValueKindToSnowflakeTypeMap = map[QValueKind]string{
 	QValueKindArrayBoolean:     "VARIANT",
 }
 
-var QValueKindToClickhouseTypeMap = map[QValueKind]string{
+var QValueKindToClickHouseTypeMap = map[QValueKind]string{
 	QValueKindBoolean:     "Bool",
 	QValueKindInt16:       "Int16",
 	QValueKindInt32:       "Int32",
@@ -110,7 +110,7 @@ var QValueKindToClickhouseTypeMap = map[QValueKind]string{
 	QValueKindTimestamp:   "DateTime64(6)",
 	QValueKindTimestampTZ: "DateTime64(6)",
 	QValueKindTime:        "String",
-	QValueKindDate:        "Date",
+	QValueKindDate:        "Date32",
 	QValueKindBytes:       "String",
 	QValueKindStruct:      "String",
 	QValueKindUUID:        "UUID",
@@ -137,7 +137,7 @@ func (kind QValueKind) ToDWHColumnType(dwhType protos.DBType) (string, error) {
 			return "STRING", nil
 		}
 	case protos.DBType_CLICKHOUSE:
-		if val, ok := QValueKindToClickhouseTypeMap[kind]; ok {
+		if val, ok := QValueKindToClickHouseTypeMap[kind]; ok {
 			return val, nil
 		} else {
 			return "String", nil

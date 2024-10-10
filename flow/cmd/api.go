@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
+	"github.com/PeerDB-io/peer-flow/auth"
 	"github.com/PeerDB-io/peer-flow/generated/protos"
 	"github.com/PeerDB-io/peer-flow/logger"
 	"github.com/PeerDB-io/peer-flow/peerdbenv"
@@ -33,8 +34,6 @@ import (
 type APIServerParams struct {
 	TemporalHostPort  string
 	TemporalNamespace string
-	TemporalCert      string
-	TemporalKey       string
 	Port              uint16
 	GatewayPort       uint16
 }
@@ -192,10 +191,11 @@ func APIMain(ctx context.Context, args *APIServerParams) error {
 		Namespace: args.TemporalNamespace,
 		Logger:    slog.New(logger.NewHandler(slog.NewJSONHandler(os.Stdout, nil))),
 	}
-	if args.TemporalCert != "" && args.TemporalKey != "" {
+
+	if peerdbenv.PeerDBTemporalEnableCertAuth() {
 		slog.Info("Using temporal certificate/key for authentication")
 
-		certs, err := base64DecodeCertAndKey(args.TemporalCert, args.TemporalKey)
+		certs, err := parseTemporalCertAndKey()
 		if err != nil {
 			return fmt.Errorf("unable to base64 decode certificate and key: %w", err)
 		}
@@ -214,7 +214,14 @@ func APIMain(ctx context.Context, args *APIServerParams) error {
 		return fmt.Errorf("unable to create Temporal client: %w", err)
 	}
 
-	grpcServer := grpc.NewServer()
+	options, err := auth.AuthGrpcMiddleware([]string{
+		grpc_health_v1.Health_Check_FullMethodName,
+		grpc_health_v1.Health_Watch_FullMethodName,
+	})
+	if err != nil {
+		return err
+	}
+	grpcServer := grpc.NewServer(options...)
 
 	catalogPool, err := peerdbenv.GetCatalogConnectionPoolFromEnv(ctx)
 	if err != nil {

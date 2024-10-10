@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 
@@ -17,22 +16,22 @@ import (
 	"github.com/PeerDB-io/peer-flow/shared"
 )
 
-type ClickhouseAvroSyncMethod struct {
+type ClickHouseAvroSyncMethod struct {
 	config    *protos.QRepConfig
-	connector *ClickhouseConnector
+	connector *ClickHouseConnector
 }
 
-func NewClickhouseAvroSyncMethod(
+func NewClickHouseAvroSyncMethod(
 	config *protos.QRepConfig,
-	connector *ClickhouseConnector,
-) *ClickhouseAvroSyncMethod {
-	return &ClickhouseAvroSyncMethod{
+	connector *ClickHouseConnector,
+) *ClickHouseAvroSyncMethod {
+	return &ClickHouseAvroSyncMethod{
 		config:    config,
 		connector: connector,
 	}
 }
 
-func (s *ClickhouseAvroSyncMethod) CopyStageToDestination(ctx context.Context, avroFile *avro.AvroFile) error {
+func (s *ClickHouseAvroSyncMethod) CopyStageToDestination(ctx context.Context, avroFile *avro.AvroFile) error {
 	stagingPath := s.connector.credsProvider.BucketPath
 	s3o, err := utils.NewS3BucketAndPrefix(stagingPath)
 	if err != nil {
@@ -58,7 +57,7 @@ func (s *ClickhouseAvroSyncMethod) CopyStageToDestination(ctx context.Context, a
 	return s.connector.database.Exec(ctx, query)
 }
 
-func (s *ClickhouseAvroSyncMethod) SyncRecords(
+func (s *ClickHouseAvroSyncMethod) SyncRecords(
 	ctx context.Context,
 	stream *model.QRecordStream,
 	flowJobName string,
@@ -95,14 +94,13 @@ func (s *ClickhouseAvroSyncMethod) SyncRecords(
 	return avroFile.NumRecords, nil
 }
 
-func (s *ClickhouseAvroSyncMethod) SyncQRepRecords(
+func (s *ClickHouseAvroSyncMethod) SyncQRepRecords(
 	ctx context.Context,
 	config *protos.QRepConfig,
 	partition *protos.QRepPartition,
 	dstTableSchema []driver.ColumnType,
 	stream *model.QRecordStream,
 ) (int, error) {
-	startTime := time.Now()
 	dstTableName := config.DestinationTableIdentifier
 	stagingPath := s.connector.credsProvider.BucketPath
 
@@ -151,21 +149,15 @@ func (s *ClickhouseAvroSyncMethod) SyncQRepRecords(
 		config.DestinationTableIdentifier, selectorStr, selectorStr, avroFileUrl,
 		creds.AWS.AccessKeyID, creds.AWS.SecretAccessKey, sessionTokenPart)
 
-	err = s.connector.database.Exec(ctx, query)
-	if err != nil {
-		s.connector.logger.Error("Failed to insert into select for Clickhouse: ", err)
+	if err := s.connector.database.Exec(ctx, query); err != nil {
+		s.connector.logger.Error("Failed to insert into select for ClickHouse", slog.Any("error", err))
 		return 0, err
-	}
-
-	err = s.insertMetadata(ctx, partition, config.FlowJobName, startTime)
-	if err != nil {
-		return -1, err
 	}
 
 	return avroFile.NumRecords, nil
 }
 
-func (s *ClickhouseAvroSyncMethod) getAvroSchema(
+func (s *ClickHouseAvroSyncMethod) getAvroSchema(
 	dstTableName string,
 	schema qvalue.QRecordSchema,
 ) (*model.QRecordAvroSchemaDefinition, error) {
@@ -176,7 +168,7 @@ func (s *ClickhouseAvroSyncMethod) getAvroSchema(
 	return avroSchema, nil
 }
 
-func (s *ClickhouseAvroSyncMethod) writeToAvroFile(
+func (s *ClickHouseAvroSyncMethod) writeToAvroFile(
 	ctx context.Context,
 	stream *model.QRecordStream,
 	avroSchema *model.QRecordAvroSchemaDefinition,
@@ -198,25 +190,4 @@ func (s *ClickhouseAvroSyncMethod) writeToAvroFile(
 	}
 
 	return avroFile, nil
-}
-
-func (s *ClickhouseAvroSyncMethod) insertMetadata(
-	ctx context.Context,
-	partition *protos.QRepPartition,
-	flowJobName string,
-	startTime time.Time,
-) error {
-	partitionLog := slog.String(string(shared.PartitionIDKey), partition.PartitionId)
-	insertMetadataStmt, err := s.connector.createMetadataInsertStatement(partition, flowJobName, startTime)
-	if err != nil {
-		s.connector.logger.Error("failed to create metadata insert statement",
-			slog.Any("error", err), partitionLog)
-		return fmt.Errorf("failed to create metadata insert statement: %w", err)
-	}
-
-	if err := s.connector.database.Exec(ctx, insertMetadataStmt); err != nil {
-		return fmt.Errorf("failed to execute metadata insert statement: %w", err)
-	}
-
-	return nil
 }

@@ -600,11 +600,9 @@ func (c *BigQueryConnector) CleanupSetupNormalizedTables(_ context.Context, _ in
 func (c *BigQueryConnector) SetupNormalizedTable(
 	ctx context.Context,
 	tx interface{},
-	env map[string]string,
+	config *protos.SetupNormalizedTableBatchInput,
 	tableIdentifier string,
 	tableSchema *protos.TableSchema,
-	softDeleteColName string,
-	syncedAtColName string,
 ) (bool, error) {
 	datasetTablesSet := tx.(map[datasetTable]struct{})
 
@@ -652,18 +650,18 @@ func (c *BigQueryConnector) SetupNormalizedTable(
 		columns = append(columns, &bqFieldSchema)
 	}
 
-	if softDeleteColName != "" {
+	if config.SoftDeleteColName != "" {
 		columns = append(columns, &bigquery.FieldSchema{
-			Name:                   softDeleteColName,
+			Name:                   config.SoftDeleteColName,
 			Type:                   bigquery.BooleanFieldType,
 			Repeated:               false,
 			DefaultValueExpression: "false",
 		})
 	}
 
-	if syncedAtColName != "" {
+	if config.SyncedAtColName != "" {
 		columns = append(columns, &bigquery.FieldSchema{
-			Name:     syncedAtColName,
+			Name:     config.SyncedAtColName,
 			Type:     bigquery.TimestampFieldType,
 			Repeated: false,
 		})
@@ -682,15 +680,15 @@ func (c *BigQueryConnector) SetupNormalizedTable(
 		}
 	}
 
-	timePartitionEnabled, err := peerdbenv.PeerDBBigQueryEnableSyncedAtPartitioning(ctx, env)
+	timePartitionEnabled, err := peerdbenv.PeerDBBigQueryEnableSyncedAtPartitioning(ctx, config.Env)
 	if err != nil {
 		return false, fmt.Errorf("failed to get dynamic setting for BigQuery time partitioning: %w", err)
 	}
 	var timePartitioning *bigquery.TimePartitioning
-	if timePartitionEnabled && syncedAtColName != "" {
+	if timePartitionEnabled && config.SyncedAtColName != "" {
 		timePartitioning = &bigquery.TimePartitioning{
 			Type:  bigquery.DayPartitioningType,
-			Field: syncedAtColName,
+			Field: config.SyncedAtColName,
 		}
 	}
 
@@ -699,6 +697,21 @@ func (c *BigQueryConnector) SetupNormalizedTable(
 		Name:             datasetTable.table,
 		Clustering:       clustering,
 		TimePartitioning: timePartitioning,
+	}
+
+	if config.IsResync {
+		_, existsErr := table.Metadata(ctx)
+		if existsErr == nil {
+			c.logger.Info("[bigquery] deleting existing resync table",
+				slog.String("table", tableIdentifier))
+			deleteErr := table.Delete(ctx)
+			if deleteErr != nil {
+				return false, fmt.Errorf("failed to delete table %s: %w", tableIdentifier, deleteErr)
+			}
+		} else if !strings.Contains(existsErr.Error(), "notFound") {
+			return false, fmt.Errorf("error while checking metadata for BigQuery resynced table %s: %w",
+				tableIdentifier, existsErr)
+		}
 	}
 
 	c.logger.Info("[bigquery] creating table",
@@ -739,7 +752,11 @@ func (c *BigQueryConnector) getRawTableName(flowJobName string) string {
 	return "_peerdb_raw_" + shared.ReplaceIllegalCharactersWithUnderscores(flowJobName)
 }
 
-func (c *BigQueryConnector) RenameTables(ctx context.Context, req *protos.RenameTablesInput) (*protos.RenameTablesOutput, error) {
+func (c *BigQueryConnector) RenameTables(
+	ctx context.Context,
+	req *protos.RenameTablesInput,
+	tableNameSchemaMapping map[string]*protos.TableSchema,
+) (*protos.RenameTablesOutput, error) {
 	// BigQuery doesn't really do transactions properly anyway so why bother?
 	for _, renameRequest := range req.RenameTableOptions {
 		srcDatasetTable, _ := c.convertToDatasetTable(renameRequest.CurrentName)
@@ -747,87 +764,104 @@ func (c *BigQueryConnector) RenameTables(ctx context.Context, req *protos.Rename
 		c.logger.Info(fmt.Sprintf("renaming table '%s' to '%s'...", srcDatasetTable.string(),
 			dstDatasetTable.string()))
 
-		// if source table does not exist, log and continue.
+		// if _resync table does not exist, log and continue.
 		dataset := c.client.DatasetInProject(c.projectID, srcDatasetTable.dataset)
 		_, err := dataset.Table(srcDatasetTable.table).Metadata(ctx)
 		if err != nil {
-			c.logger.Info(fmt.Sprintf("table '%s' does not exist, skipping rename", srcDatasetTable.string()))
+			if !strings.Contains(err.Error(), "notFound") {
+				return nil, fmt.Errorf("[renameTable] failed to get metadata for _resync table %s: %w", srcDatasetTable.string(), err)
+			}
+			c.logger.Info(fmt.Sprintf("table '%s' does not exist, skipping...", srcDatasetTable.string()))
 			continue
 		}
 
-		// For a table with replica identity full and a JSON column
-		// the equals to comparison we do down below will fail
-		// so we need to use TO_JSON_STRING for those columns
-		columnIsJSON := make(map[string]bool, len(renameRequest.TableSchema.Columns))
-		columnNames := make([]string, 0, len(renameRequest.TableSchema.Columns))
-		for _, col := range renameRequest.TableSchema.Columns {
-			quotedCol := "`" + col.Name + "`"
-			columnNames = append(columnNames, quotedCol)
-			columnIsJSON[quotedCol] = (col.Type == "json" || col.Type == "jsonb")
+		// if the original table does not exist, log and skip soft delete step
+		originalTableExists := true
+		_, err = dataset.Table(dstDatasetTable.table).Metadata(ctx)
+		if err != nil {
+			if !strings.Contains(err.Error(), "notFound") {
+				return nil, fmt.Errorf("[renameTable] failed to get metadata for original table %s: %w", dstDatasetTable.string(), err)
+			}
+			originalTableExists = false
+			c.logger.Info(fmt.Sprintf("original table '%s' does not exist, skipping soft delete step...", dstDatasetTable.string()))
 		}
 
-		if req.SoftDeleteColName != "" {
-			allColsBuilder := strings.Builder{}
-			for idx, col := range columnNames {
-				allColsBuilder.WriteString("_pt.")
-				allColsBuilder.WriteString(col)
-				if idx < len(columnNames)-1 {
-					allColsBuilder.WriteString(",")
-				}
+		if originalTableExists {
+			// For a table with replica identity full and a JSON column
+			// the equals to comparison we do down below will fail
+			// so we need to use TO_JSON_STRING for those columns
+			tableSchema := tableNameSchemaMapping[renameRequest.CurrentName]
+			columnIsJSON := make(map[string]bool, len(tableSchema.Columns))
+			columnNames := make([]string, 0, len(tableSchema.Columns))
+			for _, col := range tableSchema.Columns {
+				quotedCol := "`" + col.Name + "`"
+				columnNames = append(columnNames, quotedCol)
+				columnIsJSON[quotedCol] = (col.Type == "json" || col.Type == "jsonb")
 			}
 
-			allColsWithoutAlias := strings.Join(columnNames, ",")
-			allColsWithAlias := allColsBuilder.String()
-
-			pkeyCols := make([]string, 0, len(renameRequest.TableSchema.PrimaryKeyColumns))
-			for _, pkeyCol := range renameRequest.TableSchema.PrimaryKeyColumns {
-				pkeyCols = append(pkeyCols, "`"+pkeyCol+"`")
-			}
-
-			c.logger.Info(fmt.Sprintf("handling soft-deletes for table '%s'...", dstDatasetTable.string()))
-
-			pkeyOnClauseBuilder := strings.Builder{}
-			ljWhereClauseBuilder := strings.Builder{}
-			for idx, col := range pkeyCols {
-				if columnIsJSON[col] {
-					// We need to use TO_JSON_STRING for comparing JSON columns
-					pkeyOnClauseBuilder.WriteString("TO_JSON_STRING(_pt.")
-					pkeyOnClauseBuilder.WriteString(col)
-					pkeyOnClauseBuilder.WriteString(")=TO_JSON_STRING(_resync.")
-					pkeyOnClauseBuilder.WriteString(col)
-					pkeyOnClauseBuilder.WriteString(")")
-				} else {
-					pkeyOnClauseBuilder.WriteString("_pt.")
-					pkeyOnClauseBuilder.WriteString(col)
-					pkeyOnClauseBuilder.WriteString("=_resync.")
-					pkeyOnClauseBuilder.WriteString(col)
+			if req.SoftDeleteColName != "" {
+				allColsBuilder := strings.Builder{}
+				for idx, col := range columnNames {
+					allColsBuilder.WriteString("_pt.")
+					allColsBuilder.WriteString(col)
+					if idx < len(columnNames)-1 {
+						allColsBuilder.WriteString(",")
+					}
 				}
 
-				ljWhereClauseBuilder.WriteString("_resync.")
-				ljWhereClauseBuilder.WriteString(col)
-				ljWhereClauseBuilder.WriteString(" IS NULL")
+				allColsWithoutAlias := strings.Join(columnNames, ",")
+				allColsWithAlias := allColsBuilder.String()
 
-				if idx < len(pkeyCols)-1 {
-					pkeyOnClauseBuilder.WriteString(" AND ")
-					ljWhereClauseBuilder.WriteString(" AND ")
+				pkeyCols := make([]string, 0, len(tableSchema.PrimaryKeyColumns))
+				for _, pkeyCol := range tableSchema.PrimaryKeyColumns {
+					pkeyCols = append(pkeyCols, "`"+pkeyCol+"`")
 				}
-			}
 
-			leftJoin := fmt.Sprintf("LEFT JOIN %s _resync ON %s WHERE %s", srcDatasetTable.string(),
-				pkeyOnClauseBuilder.String(), ljWhereClauseBuilder.String())
+				c.logger.Info(fmt.Sprintf("handling soft-deletes for table '%s'...", dstDatasetTable.string()))
 
-			q := fmt.Sprintf("INSERT INTO %s(%s) SELECT %s,true AS %s FROM %s _pt %s",
-				srcDatasetTable.string(), fmt.Sprintf("%s,%s", allColsWithoutAlias, req.SoftDeleteColName),
-				allColsWithAlias, req.SoftDeleteColName, dstDatasetTable.string(),
-				leftJoin)
+				pkeyOnClauseBuilder := strings.Builder{}
+				ljWhereClauseBuilder := strings.Builder{}
+				for idx, col := range pkeyCols {
+					if columnIsJSON[col] {
+						// We need to use TO_JSON_STRING for comparing JSON columns
+						pkeyOnClauseBuilder.WriteString("TO_JSON_STRING(_pt.")
+						pkeyOnClauseBuilder.WriteString(col)
+						pkeyOnClauseBuilder.WriteString(")=TO_JSON_STRING(_resync.")
+						pkeyOnClauseBuilder.WriteString(col)
+						pkeyOnClauseBuilder.WriteString(")")
+					} else {
+						pkeyOnClauseBuilder.WriteString("_pt.")
+						pkeyOnClauseBuilder.WriteString(col)
+						pkeyOnClauseBuilder.WriteString("=_resync.")
+						pkeyOnClauseBuilder.WriteString(col)
+					}
 
-			query := c.queryWithLogging(q)
+					ljWhereClauseBuilder.WriteString("_resync.")
+					ljWhereClauseBuilder.WriteString(col)
+					ljWhereClauseBuilder.WriteString(" IS NULL")
 
-			query.DefaultProjectID = c.projectID
-			query.DefaultDatasetID = c.datasetID
-			_, err := query.Read(ctx)
-			if err != nil {
-				return nil, fmt.Errorf("unable to handle soft-deletes for table %s: %w", dstDatasetTable.string(), err)
+					if idx < len(pkeyCols)-1 {
+						pkeyOnClauseBuilder.WriteString(" AND ")
+						ljWhereClauseBuilder.WriteString(" AND ")
+					}
+				}
+
+				leftJoin := fmt.Sprintf("LEFT JOIN %s _resync ON %s WHERE %s", srcDatasetTable.string(),
+					pkeyOnClauseBuilder.String(), ljWhereClauseBuilder.String())
+
+				q := fmt.Sprintf("INSERT INTO %s(%s) SELECT %s,true AS %s FROM %s _pt %s",
+					srcDatasetTable.string(), fmt.Sprintf("%s,%s", allColsWithoutAlias, req.SoftDeleteColName),
+					allColsWithAlias, req.SoftDeleteColName, dstDatasetTable.string(),
+					leftJoin)
+
+				query := c.queryWithLogging(q)
+
+				query.DefaultProjectID = c.projectID
+				query.DefaultDatasetID = c.datasetID
+				_, err := query.Read(ctx)
+				if err != nil {
+					return nil, fmt.Errorf("unable to handle soft-deletes for table %s: %w", dstDatasetTable.string(), err)
+				}
 			}
 		}
 
@@ -900,6 +934,29 @@ func (c *BigQueryConnector) CreateTablesFromExisting(
 	return &protos.CreateTablesFromExistingOutput{
 		FlowJobName: req.FlowJobName,
 	}, nil
+}
+
+func (c *BigQueryConnector) RemoveTableEntriesFromRawTable(
+	ctx context.Context,
+	req *protos.RemoveTablesFromRawTableInput,
+) error {
+	rawTableIdentifier := c.getRawTableName(req.FlowJobName)
+	for _, tableName := range req.DestinationTableNames {
+		c.logger.Info(fmt.Sprintf("removing entries for table '%s' from raw table...", tableName))
+		deleteCmd := c.queryWithLogging(fmt.Sprintf("DELETE FROM `%s` WHERE _peerdb_destination_table_name = '%s'"+
+			" AND _peerdb_batch_id > %d AND _peerdb_batch_id <= %d",
+			rawTableIdentifier, tableName, req.NormalizeBatchId, req.SyncBatchId))
+		deleteCmd.DefaultProjectID = c.projectID
+		deleteCmd.DefaultDatasetID = c.datasetID
+		_, err := deleteCmd.Read(ctx)
+		if err != nil {
+			c.logger.Error("failed to remove entries from raw table", "error", err)
+		}
+
+		c.logger.Info(fmt.Sprintf("successfully removed entries for table '%s' from raw table", tableName))
+	}
+
+	return nil
 }
 
 type datasetTable struct {

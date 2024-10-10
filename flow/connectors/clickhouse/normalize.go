@@ -1,10 +1,12 @@
 package connclickhouse
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"github.com/PeerDB-io/peer-flow/generated/protos"
 	"github.com/PeerDB-io/peer-flow/model"
 	"github.com/PeerDB-io/peer-flow/model/qvalue"
+	"github.com/PeerDB-io/peer-flow/peerdbenv"
 )
 
 const (
@@ -22,110 +25,202 @@ const (
 	versionColType = "Int64"
 )
 
-func (c *ClickhouseConnector) StartSetupNormalizedTables(_ context.Context) (interface{}, error) {
+var acceptableTableEngines = []string{"ReplacingMergeTree", "MergeTree"}
+
+func (c *ClickHouseConnector) StartSetupNormalizedTables(_ context.Context) (interface{}, error) {
 	return nil, nil
 }
 
-func (c *ClickhouseConnector) FinishSetupNormalizedTables(_ context.Context, _ interface{}) error {
+func (c *ClickHouseConnector) FinishSetupNormalizedTables(_ context.Context, _ interface{}) error {
 	return nil
 }
 
-func (c *ClickhouseConnector) CleanupSetupNormalizedTables(_ context.Context, _ interface{}) {
+func (c *ClickHouseConnector) CleanupSetupNormalizedTables(_ context.Context, _ interface{}) {
 }
 
-func (c *ClickhouseConnector) SetupNormalizedTable(
+func (c *ClickHouseConnector) SetupNormalizedTable(
 	ctx context.Context,
 	tx interface{},
-	env map[string]string,
+	config *protos.SetupNormalizedTableBatchInput,
 	tableIdentifier string,
 	tableSchema *protos.TableSchema,
-	softDeleteColName string,
-	syncedAtColName string,
 ) (bool, error) {
 	tableAlreadyExists, err := c.checkIfTableExists(ctx, c.config.Database, tableIdentifier)
 	if err != nil {
 		return false, fmt.Errorf("error occurred while checking if normalized table exists: %w", err)
 	}
-	if tableAlreadyExists {
+	if tableAlreadyExists && !config.IsResync {
+		c.logger.Info("[ch] normalized table already exists, skipping", "table", tableIdentifier)
 		return true, nil
 	}
 
 	normalizedTableCreateSQL, err := generateCreateTableSQLForNormalizedTable(
+		config,
 		tableIdentifier,
 		tableSchema,
-		softDeleteColName,
-		syncedAtColName,
 	)
 	if err != nil {
 		return false, fmt.Errorf("error while generating create table sql for normalized table: %w", err)
 	}
 
-	err = c.execWithLogging(ctx, normalizedTableCreateSQL)
-	if err != nil {
+	if err := c.execWithLogging(ctx, normalizedTableCreateSQL); err != nil {
 		return false, fmt.Errorf("[ch] error while creating normalized table: %w", err)
 	}
 	return false, nil
 }
 
-func generateCreateTableSQLForNormalizedTable(
-	normalizedTable string,
-	tableSchema *protos.TableSchema,
-	_ string, // softDeleteColName
-	syncedAtColName string,
-) (string, error) {
-	var stmtBuilder strings.Builder
-	stmtBuilder.WriteString(fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s` (", normalizedTable))
+func getColName(overrides map[string]string, name string) string {
+	if newName, ok := overrides[name]; ok {
+		return newName
+	}
+	return name
+}
 
+func generateCreateTableSQLForNormalizedTable(
+	config *protos.SetupNormalizedTableBatchInput,
+	tableIdentifier string,
+	tableSchema *protos.TableSchema,
+) (string, error) {
+	var tableMapping *protos.TableMapping
+	for _, tm := range config.TableMappings {
+		if tm.DestinationTableIdentifier == tableIdentifier {
+			tableMapping = tm
+			break
+		}
+	}
+
+	var stmtBuilder strings.Builder
+	stmtBuilder.WriteString("CREATE ")
+	if config.IsResync {
+		stmtBuilder.WriteString("OR REPLACE ")
+	}
+	stmtBuilder.WriteString("TABLE ")
+	if !config.IsResync {
+		stmtBuilder.WriteString("IF NOT EXISTS ")
+	}
+	stmtBuilder.WriteString("`")
+	stmtBuilder.WriteString(tableIdentifier)
+	stmtBuilder.WriteString("` (")
+
+	colNameMap := make(map[string]string)
 	for _, column := range tableSchema.Columns {
 		colName := column.Name
+		dstColName := colName
 		colType := qvalue.QValueKind(column.Type)
-		clickhouseType, err := colType.ToDWHColumnType(protos.DBType_CLICKHOUSE)
-		if err != nil {
-			return "", fmt.Errorf("error while converting column type to clickhouse type: %w", err)
+		var clickHouseType string
+		var columnSetting *protos.ColumnSetting
+		if tableMapping != nil {
+			for _, col := range tableMapping.Columns {
+				if col.SourceName == colName {
+					columnSetting = col
+					if columnSetting.DestinationName != "" {
+						dstColName = columnSetting.DestinationName
+						colNameMap[colName] = dstColName
+					}
+					if columnSetting.DestinationType != "" {
+						clickHouseType = columnSetting.DestinationType
+					}
+					break
+				}
+			}
+		}
+
+		if clickHouseType == "" {
+			var err error
+			clickHouseType, err = colType.ToDWHColumnType(protos.DBType_CLICKHOUSE)
+			if err != nil {
+				return "", fmt.Errorf("error while converting column type to ClickHouse type: %w", err)
+			}
 		}
 
 		if colType == qvalue.QValueKindNumeric {
 			precision, scale := datatypes.GetNumericTypeForWarehouse(column.TypeModifier, datatypes.ClickHouseNumericCompatibility{})
 			if column.Nullable {
-				stmtBuilder.WriteString(fmt.Sprintf("`%s` Nullable(DECIMAL(%d, %d)), ", colName, precision, scale))
+				stmtBuilder.WriteString(fmt.Sprintf("`%s` Nullable(DECIMAL(%d, %d)), ", dstColName, precision, scale))
 			} else {
-				stmtBuilder.WriteString(fmt.Sprintf("`%s` DECIMAL(%d, %d), ", colName, precision, scale))
+				stmtBuilder.WriteString(fmt.Sprintf("`%s` DECIMAL(%d, %d), ", dstColName, precision, scale))
 			}
 		} else if tableSchema.NullableEnabled && column.Nullable && !colType.IsArray() {
-			stmtBuilder.WriteString(fmt.Sprintf("`%s` Nullable(%s), ", colName, clickhouseType))
+			stmtBuilder.WriteString(fmt.Sprintf("`%s` Nullable(%s), ", dstColName, clickHouseType))
 		} else {
-			stmtBuilder.WriteString(fmt.Sprintf("`%s` %s, ", colName, clickhouseType))
+			stmtBuilder.WriteString(fmt.Sprintf("`%s` %s, ", dstColName, clickHouseType))
 		}
 	}
 	// TODO support soft delete
 	// synced at column will be added to all normalized tables
-	if syncedAtColName != "" {
-		colName := strings.ToLower(syncedAtColName)
-		stmtBuilder.WriteString(fmt.Sprintf("`%s` %s, ", colName, "DateTime64(9) DEFAULT now64()"))
+	if config.SyncedAtColName != "" {
+		colName := strings.ToLower(config.SyncedAtColName)
+		stmtBuilder.WriteString(fmt.Sprintf("`%s` DateTime64(9) DEFAULT now64(), ", colName))
+	}
+
+	var engine string
+	if tableMapping == nil {
+		engine = fmt.Sprintf("ReplacingMergeTree(`%s`)", versionColName)
+	} else if tableMapping.Engine == protos.TableEngine_CH_ENGINE_MERGE_TREE {
+		engine = "MergeTree()"
+	} else {
+		engine = fmt.Sprintf("ReplacingMergeTree(`%s`)", versionColName)
 	}
 
 	// add sign and version columns
 	stmtBuilder.WriteString(fmt.Sprintf(
-		"`%s` %s, `%s` %s) ENGINE = ReplacingMergeTree(`%s`)",
-		signColName, signColType, versionColName, versionColType, versionColName))
+		"`%s` %s, `%s` %s) ENGINE = %s",
+		signColName, signColType, versionColName, versionColType, engine))
 
+	var pkeyStr string
 	pkeys := tableSchema.PrimaryKeyColumns
 	if len(pkeys) > 0 {
-		pkeyStr := strings.Join(pkeys, ",")
+		if len(colNameMap) > 0 {
+			pkeys = slices.Clone(pkeys)
+			for idx, pk := range pkeys {
+				pkeys[idx] = getColName(colNameMap, pk)
+			}
+		}
+		pkeyStr = strings.Join(pkeys, ",")
 
 		stmtBuilder.WriteString("PRIMARY KEY (")
 		stmtBuilder.WriteString(pkeyStr)
 		stmtBuilder.WriteString(") ")
+	}
 
+	var orderby []*protos.ColumnSetting
+	if tableMapping != nil {
+		orderby = slices.Clone(tableMapping.Columns)
+		for _, col := range tableMapping.Columns {
+			if col.Ordering > 0 && !slices.Contains(pkeys, getColName(colNameMap, col.SourceName)) {
+				orderby = append(orderby, col)
+			}
+		}
+
+		if len(orderby) > 0 {
+			slices.SortStableFunc(orderby, func(a *protos.ColumnSetting, b *protos.ColumnSetting) int {
+				return cmp.Compare(a.Ordering, b.Ordering)
+			})
+		}
+	}
+
+	if pkeyStr != "" || len(orderby) > 0 {
 		stmtBuilder.WriteString("ORDER BY (")
 		stmtBuilder.WriteString(pkeyStr)
-		stmtBuilder.WriteString(")")
+		if len(orderby) > 0 {
+			orderbyColumns := make([]string, len(orderby))
+			for idx, col := range orderby {
+				orderbyColumns[idx] = getColName(colNameMap, col.SourceName)
+			}
+
+			if pkeyStr != "" {
+				stmtBuilder.WriteRune(',')
+			}
+			stmtBuilder.WriteString(strings.Join(orderbyColumns, ","))
+		}
+		stmtBuilder.WriteRune(')')
 	}
 
 	return stmtBuilder.String(), nil
 }
 
-func (c *ClickhouseConnector) NormalizeRecords(ctx context.Context,
+func (c *ClickHouseConnector) NormalizeRecords(
+	ctx context.Context,
 	req *model.NormalizeRecordsRequest,
 ) (*model.NormalizeResponse, error) {
 	// fix for potential consistency issues
@@ -171,38 +266,101 @@ func (c *ClickhouseConnector) NormalizeRecords(ctx context.Context,
 		selectQuery.WriteString("SELECT ")
 
 		colSelector := strings.Builder{}
-		colSelector.WriteString("(")
+		colSelector.WriteRune('(')
 
 		schema := req.TableNameSchemaMapping[tbl]
 
+		var tableMapping *protos.TableMapping
+		for _, tm := range req.TableMappings {
+			if tm.DestinationTableIdentifier == tbl {
+				tableMapping = tm
+				break
+			}
+		}
+
+		enablePrimaryUpdate, err := peerdbenv.PeerDBEnableClickHousePrimaryUpdate(ctx, req.Env)
+		if err != nil {
+			return nil, err
+		}
+
 		projection := strings.Builder{}
+		projectionUpdate := strings.Builder{}
 
 		for _, column := range schema.Columns {
-			cn := column.Name
-			ct := column.Type
+			colName := column.Name
+			dstColName := colName
+			colType := qvalue.QValueKind(column.Type)
 
-			colSelector.WriteString(fmt.Sprintf("`%s`,", cn))
-			colType := qvalue.QValueKind(ct)
-			clickhouseType, err := colType.ToDWHColumnType(protos.DBType_CLICKHOUSE)
-			if err != nil {
-				return nil, fmt.Errorf("error while converting column type to clickhouse type: %w", err)
+			var clickHouseType string
+			if tableMapping != nil {
+				for _, col := range tableMapping.Columns {
+					if col.SourceName == colName {
+						if col.DestinationName != "" {
+							dstColName = col.DestinationName
+						}
+						if col.DestinationType != "" {
+							// TODO can we restrict this to avoid injection?
+							clickHouseType = col.DestinationType
+						}
+						break
+					}
+				}
 			}
 
-			switch clickhouseType {
-			case "Date":
+			colSelector.WriteString(fmt.Sprintf("`%s`,", dstColName))
+			if clickHouseType == "" {
+				if colType == qvalue.QValueKindNumeric {
+					precision, scale := datatypes.GetNumericTypeForWarehouse(column.TypeModifier, datatypes.ClickHouseNumericCompatibility{})
+					clickHouseType = fmt.Sprintf("Decimal(%d, %d)", precision, scale)
+				} else {
+					var err error
+					clickHouseType, err = colType.ToDWHColumnType(protos.DBType_CLICKHOUSE)
+					if err != nil {
+						return nil, fmt.Errorf("error while converting column type to clickhouse type: %w", err)
+					}
+				}
+				if schema.NullableEnabled && column.Nullable && !colType.IsArray() {
+					clickHouseType = fmt.Sprintf("Nullable(%s)", clickHouseType)
+				}
+			}
+
+			switch clickHouseType {
+			case "Date32", "Nullable(Date32)":
 				projection.WriteString(fmt.Sprintf(
-					"toDate(parseDateTime64BestEffortOrNull(JSONExtractString(_peerdb_data, '%s'))) AS `%s`,",
-					cn,
-					cn,
+					"toDate32(parseDateTime64BestEffortOrNull(JSONExtractString(_peerdb_data, '%s'))) AS `%s`,",
+					colName,
+					dstColName,
 				))
-			case "DateTime64(6)":
+				if enablePrimaryUpdate {
+					projectionUpdate.WriteString(fmt.Sprintf(
+						"toDate32(parseDateTime64BestEffortOrNull(JSONExtractString(_peerdb_match_data, '%s'))) AS `%s`,",
+						colName,
+						dstColName,
+					))
+				}
+			case "DateTime64(6)", "Nullable(DateTime64(6))":
 				projection.WriteString(fmt.Sprintf(
 					"parseDateTime64BestEffortOrNull(JSONExtractString(_peerdb_data, '%s')) AS `%s`,",
-					cn,
-					cn,
+					colName,
+					dstColName,
 				))
+				if enablePrimaryUpdate {
+					projectionUpdate.WriteString(fmt.Sprintf(
+						"parseDateTime64BestEffortOrNull(JSONExtractString(_peerdb_match_data, '%s')) AS `%s`,",
+						colName,
+						dstColName,
+					))
+				}
 			default:
-				projection.WriteString(fmt.Sprintf("JSONExtract(_peerdb_data, '%s', '%s') AS `%s`,", cn, clickhouseType, cn))
+				projection.WriteString(fmt.Sprintf("JSONExtract(_peerdb_data, '%s', '%s') AS `%s`,", colName, clickHouseType, dstColName))
+				if enablePrimaryUpdate {
+					projectionUpdate.WriteString(fmt.Sprintf(
+						"JSONExtract(_peerdb_match_data, '%s', '%s') AS `%s`,",
+						colName,
+						clickHouseType,
+						dstColName,
+					))
+				}
 			}
 		}
 
@@ -226,7 +384,25 @@ func (c *ClickhouseConnector) NormalizeRecords(ctx context.Context,
 		selectQuery.WriteString(tbl)
 		selectQuery.WriteString("'")
 
-		selectQuery.WriteString(" ORDER BY _peerdb_timestamp")
+		if enablePrimaryUpdate {
+			// projectionUpdate generates delete on previous record, so _peerdb_record_type is filled in as 2
+			projectionUpdate.WriteString(fmt.Sprintf("1 AS `%s`,", signColName))
+			// decrement timestamp by 1 so delete is ordered before latest data,
+			// could be same if deletion records were only generated when ordering updated
+			projectionUpdate.WriteString(fmt.Sprintf("_peerdb_timestamp - 1 AS `%s`", versionColName))
+
+			selectQuery.WriteString("UNION ALL SELECT ")
+			selectQuery.WriteString(projectionUpdate.String())
+			selectQuery.WriteString(" FROM ")
+			selectQuery.WriteString(rawTbl)
+			selectQuery.WriteString(" WHERE _peerdb_batch_id > ")
+			selectQuery.WriteString(strconv.FormatInt(normBatchID, 10))
+			selectQuery.WriteString(" AND _peerdb_batch_id <= ")
+			selectQuery.WriteString(strconv.FormatInt(req.SyncBatchID, 10))
+			selectQuery.WriteString(" AND _peerdb_destination_table_name = '")
+			selectQuery.WriteString(tbl)
+			selectQuery.WriteString("' AND _peerdb_record_type = 1")
+		}
 
 		insertIntoSelectQuery := strings.Builder{}
 		insertIntoSelectQuery.WriteString("INSERT INTO ")
@@ -236,14 +412,12 @@ func (c *ClickhouseConnector) NormalizeRecords(ctx context.Context,
 
 		q := insertIntoSelectQuery.String()
 
-		err = c.execWithLogging(ctx, q)
-		if err != nil {
+		if err := c.execWithLogging(ctx, q); err != nil {
 			return nil, fmt.Errorf("error while inserting into normalized table: %w", err)
 		}
 	}
 
-	endNormalizeBatchId := normBatchID + 1
-	err = c.UpdateNormalizeBatchID(ctx, req.FlowJobName, endNormalizeBatchId)
+	err = c.UpdateNormalizeBatchID(ctx, req.FlowJobName, req.SyncBatchID)
 	if err != nil {
 		c.logger.Error("[clickhouse] error while updating normalize batch id", "error", err)
 		return nil, err
@@ -251,12 +425,12 @@ func (c *ClickhouseConnector) NormalizeRecords(ctx context.Context,
 
 	return &model.NormalizeResponse{
 		Done:         true,
-		StartBatchID: endNormalizeBatchId,
+		StartBatchID: normBatchID + 1,
 		EndBatchID:   req.SyncBatchID,
 	}, nil
 }
 
-func (c *ClickhouseConnector) getDistinctTableNamesInBatch(
+func (c *ClickHouseConnector) getDistinctTableNamesInBatch(
 	ctx context.Context,
 	flowJobName string,
 	syncBatchID int64,
@@ -268,7 +442,7 @@ func (c *ClickhouseConnector) getDistinctTableNamesInBatch(
 		`SELECT DISTINCT _peerdb_destination_table_name FROM %s WHERE _peerdb_batch_id > %d AND _peerdb_batch_id <= %d`,
 		rawTbl, normalizeBatchID, syncBatchID)
 
-	rows, err := c.database.Query(ctx, q)
+	rows, err := c.query(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("error while querying raw table for distinct table names in batch: %w", err)
 	}
@@ -288,30 +462,29 @@ func (c *ClickhouseConnector) getDistinctTableNamesInBatch(
 		tableNames = append(tableNames, tableName.String)
 	}
 
-	err = rows.Err()
-	if err != nil {
+	if rows.Err() != nil {
 		return nil, fmt.Errorf("failed to read rows: %w", err)
 	}
 
 	return tableNames, nil
 }
 
-func (c *ClickhouseConnector) copyAvroStageToDestination(ctx context.Context, flowJobName string, syncBatchID int64) error {
-	avroSynvMethod := c.avroSyncMethod(flowJobName)
+func (c *ClickHouseConnector) copyAvroStageToDestination(ctx context.Context, flowJobName string, syncBatchID int64) error {
+	avroSyncMethod := c.avroSyncMethod(flowJobName)
 	avroFile, err := c.s3Stage.GetAvroStage(ctx, flowJobName, syncBatchID)
 	if err != nil {
 		return fmt.Errorf("failed to get avro stage: %w", err)
 	}
 	defer avroFile.Cleanup()
 
-	err = avroSynvMethod.CopyStageToDestination(ctx, avroFile)
+	err = avroSyncMethod.CopyStageToDestination(ctx, avroFile)
 	if err != nil {
 		return fmt.Errorf("failed to copy stage to destination: %w", err)
 	}
 	return nil
 }
 
-func (c *ClickhouseConnector) copyAvroStagesToDestination(
+func (c *ClickHouseConnector) copyAvroStagesToDestination(
 	ctx context.Context, flowJobName string, normBatchID, syncBatchID int64,
 ) error {
 	for s := normBatchID + 1; s <= syncBatchID; s++ {

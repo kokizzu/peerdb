@@ -67,56 +67,31 @@ func (h *FlowRequestHandler) MirrorStatus(
 	workflowID, err := h.getWorkflowID(ctx, req.FlowJobName)
 	if err != nil {
 		slog.Error("unable to get the workflow ID of mirror", slog.Any("error", err))
-		return &protos.MirrorStatusResponse{
-			FlowJobName:      req.FlowJobName,
-			CurrentFlowState: protos.FlowStatus_STATUS_UNKNOWN,
-			ErrorMessage:     "unable to get the workflow ID of mirror " + req.FlowJobName,
-			Ok:               false,
-		}, nil
+		return nil, fmt.Errorf("unable to get the workflow ID of mirror %s: %w", req.FlowJobName, err)
 	}
 
 	currState, err := h.getWorkflowStatus(ctx, workflowID)
 	if err != nil {
 		slog.Error("unable to get the running status of mirror", slog.Any("error", err))
-		return &protos.MirrorStatusResponse{
-			FlowJobName:      req.FlowJobName,
-			CurrentFlowState: protos.FlowStatus_STATUS_UNKNOWN,
-			ErrorMessage:     "unable to get the running status of mirror " + req.FlowJobName,
-			Ok:               false,
-		}, nil
+		return nil, fmt.Errorf("unable to get the running status of mirror %s: %w", req.FlowJobName, err)
 	}
 
 	createdAt, err := h.getMirrorCreatedAt(ctx, req.FlowJobName)
 	if err != nil {
-		return &protos.MirrorStatusResponse{
-			FlowJobName:      req.FlowJobName,
-			CurrentFlowState: protos.FlowStatus_STATUS_UNKNOWN,
-			ErrorMessage:     "unable to get the creation time of mirror " + req.FlowJobName,
-			Ok:               false,
-		}, nil
+		return nil, fmt.Errorf("unable to get the creation time of mirror %s: %w", req.FlowJobName, err)
 	}
 
 	if req.IncludeFlowInfo {
 		cdcFlow, err := h.isCDCFlow(ctx, req.FlowJobName)
 		if err != nil {
 			slog.Error("unable to determine if mirror is cdc", slog.Any("error", err))
-			return &protos.MirrorStatusResponse{
-				FlowJobName:      req.FlowJobName,
-				CurrentFlowState: protos.FlowStatus_STATUS_UNKNOWN,
-				ErrorMessage:     "unable to determine if mirror" + req.FlowJobName + "is of type CDC.",
-				Ok:               false,
-			}, nil
+			return nil, fmt.Errorf("unable to determine if mirror %s is of type CDC: %w", req.FlowJobName, err)
 		}
 		if cdcFlow {
 			cdcStatus, err := h.cdcFlowStatus(ctx, req)
 			if err != nil {
 				slog.Error("unable to obtain CDC information for mirror", slog.Any("error", err))
-				return &protos.MirrorStatusResponse{
-					FlowJobName:      req.FlowJobName,
-					CurrentFlowState: protos.FlowStatus_STATUS_UNKNOWN,
-					ErrorMessage:     "unable to obtain CDC information for mirror " + req.FlowJobName,
-					Ok:               false,
-				}, nil
+				return nil, fmt.Errorf("unable to obtain CDC information for mirror %s: %w", req.FlowJobName, err)
 			}
 
 			return &protos.MirrorStatusResponse{
@@ -125,19 +100,13 @@ func (h *FlowRequestHandler) MirrorStatus(
 					CdcStatus: cdcStatus,
 				},
 				CurrentFlowState: currState,
-				Ok:               true,
 				CreatedAt:        timestamppb.New(*createdAt),
 			}, nil
 		} else {
 			qrepStatus, err := h.qrepFlowStatus(ctx, req)
 			if err != nil {
 				slog.Error("unable to obtain qrep information for mirror", slog.Any("error", err))
-				return &protos.MirrorStatusResponse{
-					FlowJobName:      req.FlowJobName,
-					CurrentFlowState: protos.FlowStatus_STATUS_UNKNOWN,
-					ErrorMessage:     "unable to obtain snapshot information for mirror " + req.FlowJobName,
-					Ok:               false,
-				}, nil
+				return nil, fmt.Errorf("unable to obtain snapshot information for mirror %s: %w", req.FlowJobName, err)
 			}
 
 			return &protos.MirrorStatusResponse{
@@ -146,7 +115,6 @@ func (h *FlowRequestHandler) MirrorStatus(
 					QrepStatus: qrepStatus,
 				},
 				CurrentFlowState: currState,
-				Ok:               true,
 				CreatedAt:        timestamppb.New(*createdAt),
 			}, nil
 		}
@@ -155,7 +123,6 @@ func (h *FlowRequestHandler) MirrorStatus(
 	return &protos.MirrorStatusResponse{
 		FlowJobName:      req.FlowJobName,
 		CurrentFlowState: currState,
-		Ok:               true,
 		CreatedAt:        timestamppb.New(*createdAt),
 	}, nil
 }
@@ -199,13 +166,18 @@ func (h *FlowRequestHandler) cdcFlowStatus(
 		return nil, err
 	}
 
-	cloneStatuses, err := h.cloneTableSummary(ctx, req.FlowJobName)
+	initialLoadResponse, err := h.InitialLoadSummary(ctx, &protos.InitialLoadSummaryRequest{
+		ParentMirrorName: req.FlowJobName,
+	})
 	if err != nil {
 		slog.Error("unable to query clone table summary", slog.Any("error", err))
 		return nil, err
 	}
 
-	cdcBatches, err := h.getCdcBatches(ctx, req.FlowJobName)
+	cdcBatchesResponse, err := h.GetCDCBatches(ctx, &protos.GetCDCBatchesRequest{
+		FlowJobName: req.FlowJobName,
+		Limit:       0,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -215,16 +187,17 @@ func (h *FlowRequestHandler) cdcFlowStatus(
 		SourceType:      srcType,
 		DestinationType: dstType,
 		SnapshotStatus: &protos.SnapshotStatus{
-			Clones: cloneStatuses,
+			Clones: initialLoadResponse.TableSummaries,
 		},
-		CdcBatches: cdcBatches,
+		CdcBatches: cdcBatchesResponse.CdcBatches,
 	}, nil
 }
 
-func (h *FlowRequestHandler) cloneTableSummary(
+func (h *FlowRequestHandler) InitialLoadSummary(
 	ctx context.Context,
-	mirrorName string,
-) ([]*protos.CloneTableSummary, error) {
+	req *protos.InitialLoadSummaryRequest,
+) (*protos.InitialLoadSummaryResponse, error) {
+	parentMirrorName := req.ParentMirrorName
 	q := `
 	SELECT
 		distinct qr.flow_name,
@@ -239,7 +212,7 @@ func (h *FlowRequestHandler) cloneTableSummary(
 		AVG(EXTRACT(EPOCH FROM (qp.end_time - qp.start_time)) * 1000) FILTER (WHERE qp.end_time IS NOT NULL) AS AvgTimePerPartitionMs
 	FROM peerdb_stats.qrep_partitions qp
 	RIGHT JOIN peerdb_stats.qrep_runs qr ON qp.flow_name = qr.flow_name
-	WHERE qr.flow_name ^@ ($1||regexp_replace(qr.destination_table, '[^a-zA-Z0-9_]', '_', 'g'))
+	WHERE qr.parent_mirror_name = $1
 	GROUP BY qr.flow_name, qr.destination_table, qr.source_table, qr.start_time, qr.fetch_complete, qr.consolidate_complete;
 	`
 	var flowName pgtype.Text
@@ -253,11 +226,11 @@ func (h *FlowRequestHandler) cloneTableSummary(
 	var numRowsSynced pgtype.Int8
 	var avgTimePerPartitionMs pgtype.Float8
 
-	rows, err := h.pool.Query(ctx, q, fmt.Sprintf("clone_%s_", mirrorName))
+	rows, err := h.pool.Query(ctx, q, parentMirrorName)
 	if err != nil {
 		slog.Error("unable to query initial load partition",
-			slog.String(string(shared.FlowNameKey), mirrorName), slog.Any("error", err))
-		return nil, fmt.Errorf("unable to query initial load partition - %s: %w", mirrorName, err)
+			slog.String(string(shared.FlowNameKey), parentMirrorName), slog.Any("error", err))
+		return nil, fmt.Errorf("unable to query initial load partition - %s: %w", parentMirrorName, err)
 	}
 
 	defer rows.Close()
@@ -276,7 +249,7 @@ func (h *FlowRequestHandler) cloneTableSummary(
 			&numRowsSynced,
 			&avgTimePerPartitionMs,
 		); err != nil {
-			return nil, fmt.Errorf("unable to scan initial load partition - %s: %w", mirrorName, err)
+			return nil, fmt.Errorf("unable to scan initial load partition - %s: %w", parentMirrorName, err)
 		}
 
 		var res protos.CloneTableSummary
@@ -321,11 +294,13 @@ func (h *FlowRequestHandler) cloneTableSummary(
 			res.AvgTimePerPartitionMs = int64(avgTimePerPartitionMs.Float64)
 		}
 
-		res.MirrorName = mirrorName
+		res.MirrorName = parentMirrorName
 
 		cloneStatuses = append(cloneStatuses, &res)
 	}
-	return cloneStatuses, nil
+	return &protos.InitialLoadSummaryResponse{
+		TableSummaries: cloneStatuses,
+	}, nil
 }
 
 func (h *FlowRequestHandler) qrepFlowStatus(
@@ -478,16 +453,22 @@ func (h *FlowRequestHandler) getMirrorCreatedAt(ctx context.Context, flowJobName
 	return &createdAt.Time, nil
 }
 
-func (h *FlowRequestHandler) getCdcBatches(ctx context.Context, flowJobName string) ([]*protos.CDCBatch, error) {
+func (h *FlowRequestHandler) GetCDCBatches(ctx context.Context, req *protos.GetCDCBatchesRequest) (*protos.GetCDCBatchesResponse, error) {
+	mirrorName := req.FlowJobName
+	limit := req.Limit
+	limitClause := ""
+	if limit > 0 {
+		limitClause = fmt.Sprintf(" LIMIT %d", limit)
+	}
 	q := `SELECT DISTINCT ON(batch_id) batch_id,start_time,end_time,rows_in_batch,batch_start_lsn,batch_end_lsn FROM peerdb_stats.cdc_batches
-	  WHERE flow_name=$1 AND start_time IS NOT NULL ORDER BY batch_id DESC, start_time DESC`
-	rows, err := h.pool.Query(ctx, q, flowJobName)
+	  WHERE flow_name=$1 AND start_time IS NOT NULL ORDER BY batch_id DESC, start_time DESC` + limitClause
+	rows, err := h.pool.Query(ctx, q, mirrorName)
 	if err != nil {
-		slog.Error(fmt.Sprintf("unable to query cdc batches - %s: %s", flowJobName, err.Error()))
-		return nil, fmt.Errorf("unable to query cdc batches - %s: %w", flowJobName, err)
+		slog.Error(fmt.Sprintf("unable to query cdc batches - %s: %s", mirrorName, err.Error()))
+		return nil, fmt.Errorf("unable to query cdc batches - %s: %w", mirrorName, err)
 	}
 
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (*protos.CDCBatch, error) {
+	batches, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*protos.CDCBatch, error) {
 		var batchID pgtype.Int8
 		var startTime pgtype.Timestamp
 		var endTime pgtype.Timestamp
@@ -495,8 +476,8 @@ func (h *FlowRequestHandler) getCdcBatches(ctx context.Context, flowJobName stri
 		var startLSN pgtype.Numeric
 		var endLSN pgtype.Numeric
 		if err := rows.Scan(&batchID, &startTime, &endTime, &numRows, &startLSN, &endLSN); err != nil {
-			slog.Error(fmt.Sprintf("unable to scan cdc batches - %s: %s", flowJobName, err.Error()))
-			return nil, fmt.Errorf("unable to scan cdc batches - %s: %w", flowJobName, err)
+			slog.Error(fmt.Sprintf("unable to scan cdc batches - %s: %s", mirrorName, err.Error()))
+			return nil, fmt.Errorf("unable to scan cdc batches - %s: %w", mirrorName, err)
 		}
 
 		var batch protos.CDCBatch
@@ -522,6 +503,13 @@ func (h *FlowRequestHandler) getCdcBatches(ctx context.Context, flowJobName stri
 
 		return &batch, nil
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &protos.GetCDCBatchesResponse{
+		CdcBatches: batches,
+	}, nil
 }
 
 func (h *FlowRequestHandler) CDCTableTotalCounts(

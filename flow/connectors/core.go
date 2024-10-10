@@ -24,7 +24,7 @@ import (
 	"github.com/PeerDB-io/peer-flow/generated/protos"
 	"github.com/PeerDB-io/peer-flow/logger"
 	"github.com/PeerDB-io/peer-flow/model"
-	"github.com/PeerDB-io/peer-flow/otel_metrics/peerdb_guages"
+	"github.com/PeerDB-io/peer-flow/otel_metrics/peerdb_gauges"
 	"github.com/PeerDB-io/peer-flow/peerdbenv"
 )
 
@@ -45,7 +45,12 @@ type GetTableSchemaConnector interface {
 	Connector
 
 	// GetTableSchema returns the schema of a table in terms of QValueKind.
-	GetTableSchema(ctx context.Context, req *protos.GetTableSchemaBatchInput) (*protos.GetTableSchemaBatchOutput, error)
+	GetTableSchema(
+		ctx context.Context,
+		env map[string]string,
+		system protos.TypeSystem,
+		tableIdentifiers []string,
+	) (map[string]*protos.TableSchema, error)
 }
 
 type CDCPullConnectorCore interface {
@@ -79,9 +84,8 @@ type CDCPullConnectorCore interface {
 		ctx context.Context,
 		alerter *alerting.Alerter,
 		catalogPool *pgxpool.Pool,
-		slotName string,
-		peerName string,
-		slotMetricGuages peerdb_guages.SlotMetricGuages,
+		alertKeys *alerting.AlertKeys,
+		slotMetricGauges peerdb_gauges.SlotMetricGauges,
 	) error
 
 	// GetSlotInfo returns the WAL (or equivalent) info of a slot for the connector.
@@ -89,6 +93,9 @@ type CDCPullConnectorCore interface {
 
 	// AddTablesToPublication adds additional tables added to a mirror to the publication also
 	AddTablesToPublication(ctx context.Context, req *protos.AddTablesToPublicationInput) error
+
+	// RemoveTablesFromPublication removes tables from the publication
+	RemoveTablesFromPublication(ctx context.Context, req *protos.RemoveTablesFromPublicationInput) error
 }
 
 type CDCPullConnector interface {
@@ -123,11 +130,9 @@ type NormalizedTablesConnector interface {
 	SetupNormalizedTable(
 		ctx context.Context,
 		tx any,
-		env map[string]string,
+		config *protos.SetupNormalizedTableBatchInput,
 		tableIdentifier string,
 		tableSchema *protos.TableSchema,
-		softDeleteColName string,
-		syncedAtColName string,
 	) (bool, error)
 }
 
@@ -251,10 +256,16 @@ type QRepConsolidateConnector interface {
 	CleanupQRepFlow(ctx context.Context, config *protos.QRepConfig) error
 }
 
+type RawTableConnector interface {
+	Connector
+
+	RemoveTableEntriesFromRawTable(context.Context, *protos.RemoveTablesFromRawTableInput) error
+}
+
 type RenameTablesConnector interface {
 	Connector
 
-	RenameTables(context.Context, *protos.RenameTablesInput) (*protos.RenameTablesOutput, error)
+	RenameTables(context.Context, *protos.RenameTablesInput, map[string]*protos.TableSchema) (*protos.RenameTablesOutput, error)
 }
 
 func LoadPeerType(ctx context.Context, catalogPool *pgxpool.Pool, peerName string) (protos.DBType, error) {
@@ -379,7 +390,7 @@ func GetConnector(ctx context.Context, env map[string]string, config *protos.Pee
 	case *protos.Peer_MysqlConfig:
 		return connmysql.MySqlConnector{}, nil
 	case *protos.Peer_ClickhouseConfig:
-		return connclickhouse.NewClickhouseConnector(ctx, env, inner.ClickhouseConfig)
+		return connclickhouse.NewClickHouseConnector(ctx, env, inner.ClickhouseConfig)
 	case *protos.Peer_KafkaConfig:
 		return connkafka.NewKafkaConnector(ctx, env, inner.KafkaConfig)
 	case *protos.Peer_PubsubConfig:
@@ -434,7 +445,7 @@ var (
 	_ CDCSyncConnector = &connkafka.KafkaConnector{}
 	_ CDCSyncConnector = &connpubsub.PubSubConnector{}
 	_ CDCSyncConnector = &conns3.S3Connector{}
-	_ CDCSyncConnector = &connclickhouse.ClickhouseConnector{}
+	_ CDCSyncConnector = &connclickhouse.ClickHouseConnector{}
 	_ CDCSyncConnector = &connelasticsearch.ElasticsearchConnector{}
 
 	_ CDCSyncPgConnector = &connpostgres.PostgresConnector{}
@@ -442,7 +453,7 @@ var (
 	_ CDCNormalizeConnector = &connpostgres.PostgresConnector{}
 	_ CDCNormalizeConnector = &connbigquery.BigQueryConnector{}
 	_ CDCNormalizeConnector = &connsnowflake.SnowflakeConnector{}
-	_ CDCNormalizeConnector = &connclickhouse.ClickhouseConnector{}
+	_ CDCNormalizeConnector = &connclickhouse.ClickHouseConnector{}
 
 	_ GetTableSchemaConnector = &connpostgres.PostgresConnector{}
 	_ GetTableSchemaConnector = &connsnowflake.SnowflakeConnector{}
@@ -450,7 +461,7 @@ var (
 	_ NormalizedTablesConnector = &connpostgres.PostgresConnector{}
 	_ NormalizedTablesConnector = &connbigquery.BigQueryConnector{}
 	_ NormalizedTablesConnector = &connsnowflake.SnowflakeConnector{}
-	_ NormalizedTablesConnector = &connclickhouse.ClickhouseConnector{}
+	_ NormalizedTablesConnector = &connclickhouse.ClickHouseConnector{}
 
 	_ CreateTablesFromExistingConnector = &connbigquery.BigQueryConnector{}
 	_ CreateTablesFromExistingConnector = &connsnowflake.SnowflakeConnector{}
@@ -465,21 +476,26 @@ var (
 	_ QRepSyncConnector = &connsnowflake.SnowflakeConnector{}
 	_ QRepSyncConnector = &connkafka.KafkaConnector{}
 	_ QRepSyncConnector = &conns3.S3Connector{}
-	_ QRepSyncConnector = &connclickhouse.ClickhouseConnector{}
+	_ QRepSyncConnector = &connclickhouse.ClickHouseConnector{}
 	_ QRepSyncConnector = &connelasticsearch.ElasticsearchConnector{}
 
 	_ QRepSyncPgConnector = &connpostgres.PostgresConnector{}
 
 	_ QRepConsolidateConnector = &connsnowflake.SnowflakeConnector{}
-	_ QRepConsolidateConnector = &connclickhouse.ClickhouseConnector{}
+	_ QRepConsolidateConnector = &connclickhouse.ClickHouseConnector{}
 
 	_ RenameTablesConnector = &connsnowflake.SnowflakeConnector{}
 	_ RenameTablesConnector = &connbigquery.BigQueryConnector{}
 	_ RenameTablesConnector = &connpostgres.PostgresConnector{}
-	_ RenameTablesConnector = &connclickhouse.ClickhouseConnector{}
+	_ RenameTablesConnector = &connclickhouse.ClickHouseConnector{}
+
+	_ RawTableConnector = &connclickhouse.ClickHouseConnector{}
+	_ RawTableConnector = &connbigquery.BigQueryConnector{}
+	_ RawTableConnector = &connsnowflake.SnowflakeConnector{}
+	_ RawTableConnector = &connpostgres.PostgresConnector{}
 
 	_ ValidationConnector = &connsnowflake.SnowflakeConnector{}
-	_ ValidationConnector = &connclickhouse.ClickhouseConnector{}
+	_ ValidationConnector = &connclickhouse.ClickHouseConnector{}
 	_ ValidationConnector = &connbigquery.BigQueryConnector{}
 	_ ValidationConnector = &conns3.S3Connector{}
 

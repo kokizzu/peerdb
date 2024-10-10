@@ -274,7 +274,7 @@ export const chSchema = (hostDomains: string[]) =>
         invalid_type_error: 'User must be a string',
       })
       .min(1, 'User must be non-empty')
-      .max(64, 'User must be less than 64 characters'),
+      .max(128, 'User must be less than 128 characters'),
     password: z
       .string({
         invalid_type_error: 'Password must be a string',
@@ -306,6 +306,12 @@ export const chSchema = (hostDomains: string[]) =>
     privateKey: z
       .string({
         invalid_type_error: 'Private Key must be a string',
+      })
+      .optional()
+      .transform((e) => (e === '' ? undefined : e)),
+    rootCa: z
+      .string({
+        invalid_type_error: 'Root CA must be a string',
       })
       .optional()
       .transform((e) => (e === '' ? undefined : e)),

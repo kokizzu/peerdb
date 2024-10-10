@@ -33,21 +33,19 @@ message CreateCustomSyncRequest {
 message CreateCustomSyncResponse {
   string flow_job_name = 1;
   int32 number_of_syncs = 2;
-  string error_message = 3;
-  bool ok = 4;
 }
 
 message AlertConfig {
   int32 id = 1;
   string service_type = 2;
   string service_config = 3;
+  repeated string alert_for_mirrors = 4;
 }
 message GetAlertConfigsRequest {
 }
+
 message PostAlertConfigRequest {
-  int32 id = 1;
-  string service_type = 2;
-  string service_config = 3;
+  AlertConfig config = 1;
 }
 message DeleteAlertConfigRequest {
   int32 id = 1;
@@ -120,8 +118,6 @@ message DropPeerRequest {
 }
 
 message DropPeerResponse {
-  bool ok = 1;
-  string error_message = 2;
 }
 
 enum ValidatePeerStatus {
@@ -204,6 +200,7 @@ message PeerPublicationsResponse {
 message SchemaTablesRequest {
   string peer_name = 1;
   string schema_name = 2;
+  bool cdc_enabled = 3;
 }
 
 message SchemaTablesResponse {
@@ -322,10 +319,25 @@ message MirrorStatusResponse {
     QRepMirrorStatus qrep_status = 2;
     CDCMirrorStatus cdc_status = 3;
   }
-  string error_message = 4;
   peerdb_flow.FlowStatus current_flow_state = 5;
-  bool ok = 6;
   google.protobuf.Timestamp created_at = 7;
+}
+
+message InitialLoadSummaryRequest {
+  string parent_mirror_name = 1;
+}
+
+message InitialLoadSummaryResponse {
+  repeated CloneTableSummary tableSummaries = 1;
+}
+
+message GetCDCBatchesRequest {
+  string flow_job_name = 1;
+  uint32 limit = 2;
+}
+
+message GetCDCBatchesResponse {
+  repeated CDCBatch cdc_batches = 1;
 }
 
 message MirrorLog {
@@ -346,7 +358,6 @@ message ListMirrorLogsResponse {
 }
 
 message ValidateCDCMirrorResponse{
-  bool ok = 1;
 }
 
 message ListMirrorsItem {
@@ -377,10 +388,9 @@ message FlowStateChangeRequest {
   peerdb_flow.FlowStatus requested_flow_state = 2;
   // only can be sent in certain situations
   optional peerdb_flow.FlowConfigUpdate flow_config_update = 5;
+  bool drop_mirror_stats = 6;
 }
 message FlowStateChangeResponse {
-  bool ok = 1;
-  string error_message = 2;
 }
 
 message PeerDBVersionRequest {
@@ -391,11 +401,10 @@ message PeerDBVersionResponse {
 
 message ResyncMirrorRequest {
   string flow_job_name = 1;
+  bool drop_stats = 2;
 }
 
 message ResyncMirrorResponse {
-  bool ok = 1;
-  string error_message = 2;
 }
 
 service FlowService {
@@ -520,6 +529,14 @@ service FlowService {
   }
   rpc MirrorStatus(MirrorStatusRequest) returns (MirrorStatusResponse) {
     option (google.api.http) = { post: "/v1/mirrors/status", body: "*" };
+  }
+
+  rpc GetCDCBatches(GetCDCBatchesRequest) returns (GetCDCBatchesResponse) {
+    option (google.api.http) = { get: "/v1/mirrors/cdc/batches/{flow_job_name}"};
+  }
+
+  rpc InitialLoadSummary(InitialLoadSummaryRequest) returns (InitialLoadSummaryResponse) {
+    option (google.api.http) = { get: "/v1/mirrors/cdc/initial_load/{parent_mirror_name}"};
   }
 
   rpc GetPeerInfo(PeerInfoRequest) returns (peerdb_peers.Peer) {

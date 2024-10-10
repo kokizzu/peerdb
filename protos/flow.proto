@@ -10,11 +10,20 @@ message TableNameMapping {
   string destination_table_name = 2;
 }
 
+message ColumnSetting {
+  string source_name = 1;
+  string destination_name = 2;
+  string destination_type = 3;
+  int32 ordering = 4;
+}
+
 message TableMapping {
   string source_table_identifier = 1;
   string destination_table_identifier = 2;
   string partition_key = 3;
   repeated string exclude = 4;
+  repeated ColumnSetting columns = 5;
+  TableEngine engine = 6;
 }
 
 message SetupInput {
@@ -66,7 +75,6 @@ message FlowConnectionConfigs {
 message RenameTableOption {
   string current_name = 1;
   string new_name = 2;
-  TableSchema table_schema = 3;
 }
 
 message RenameTablesInput {
@@ -76,6 +84,13 @@ message RenameTablesInput {
   string peer_name = 6;
   string soft_delete_col_name = 7;
   string synced_at_col_name = 8;
+}
+
+message RemoveTablesFromRawTableInput {
+  string flow_job_name = 1;
+  repeated string destination_table_names = 2;
+  int64 sync_batch_id = 3;
+  int64 normalize_batch_id = 4;
 }
 
 message RenameTablesOutput {
@@ -103,7 +118,6 @@ message SyncFlowOptions {
 
 message StartNormalizeInput {
   FlowConnectionConfigs flow_connection_configs = 1;
-  map<string, TableSchema> table_name_schema_mapping = 2;
   int64 SyncBatchID = 3;
 }
 
@@ -148,6 +162,7 @@ message CreateRawTableInput {
 
 message CreateRawTableOutput { string table_identifier = 1; }
 
+// stored in catalog table table_schema_mapping, be wary of breaking changes
 message TableSchema {
   string table_identifier = 1;
   repeated string primary_key_columns = 2;
@@ -164,27 +179,25 @@ message FieldDescription {
   bool nullable = 4;
 }
 
-message GetTableSchemaBatchInput {
+message SetupTableSchemaBatchInput {
   map<string, string> env = 1;
   repeated string table_identifiers = 2;
   string flow_name = 3;
   TypeSystem system = 4;
   string peer_name = 5;
-}
-
-message GetTableSchemaBatchOutput {
-  map<string, TableSchema> table_name_schema_mapping = 1;
+  repeated TableMapping table_mappings = 6;
 }
 
 message SetupNormalizedTableBatchInput {
   map<string, string> env = 1;
-  map<string, TableSchema> table_name_schema_mapping = 2;
+  repeated TableMapping table_mappings = 3;
 
   // migration related columns
   string soft_delete_col_name = 4;
   string synced_at_col_name = 5;
   string flow_name = 6;
   string peer_name = 7;
+  bool is_resync = 8;
 }
 
 message SetupNormalizedTableOutput {
@@ -224,6 +237,11 @@ message PartitionRange {
     TimestampPartitionRange timestamp_range = 2;
     TIDPartitionRange tid_range = 3;
   }
+}
+
+enum TableEngine {
+  CH_ENGINE_REPLACING_MERGE_TREE = 0;
+  CH_ENGINE_MERGE_TREE = 1;
 }
 
 // protos for qrep
@@ -294,6 +312,8 @@ message QRepConfig {
   string snapshot_name = 23;
 
   map<string, string> env = 24;
+
+  string parent_mirror_name = 25;
 }
 
 message QRepPartition {
@@ -315,6 +335,7 @@ message DropFlowInput {
   string flow_job_name = 1;
   string source_peer_name = 2;
   string destination_peer_name = 3;
+  bool drop_flow_stats = 4;
 }
 
 message TableSchemaDelta {
@@ -370,6 +391,9 @@ message CDCFlowConfigUpdate {
   uint32 batch_size = 2;
   uint64 idle_timeout = 3;
   int32 number_of_syncs = 4;
+  repeated TableMapping removed_tables = 5;
+  // updates keys in the env map, existing keys left unchanged
+  map<string, string> updated_env = 6;
 }
 
 message QRepFlowConfigUpdate {
@@ -384,13 +408,18 @@ message FlowConfigUpdate {
 
 message SetupFlowOutput {
   map<uint32, string> src_table_id_name_mapping = 1;
-  map<string, TableSchema> table_name_schema_mapping = 2;
 }
 
 message AddTablesToPublicationInput {
   string flow_job_name = 1;
   string publication_name = 2;
   repeated TableMapping additional_tables = 3;
+}
+
+message RemoveTablesFromPublicationInput {
+  string flow_job_name = 1;
+  string publication_name = 2;
+  repeated TableMapping tables_to_remove = 3;
 }
 
 message IsQRepPartitionSyncedInput {

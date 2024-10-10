@@ -127,10 +127,15 @@ func (h *FlowRequestHandler) CreateCDCFlow(
 	ctx context.Context, req *protos.CreateCDCFlowRequest,
 ) (*protos.CreateCDCFlowResponse, error) {
 	cfg := req.ConnectionConfigs
-	_, validateErr := h.ValidateCDCMirror(ctx, req)
-	if validateErr != nil {
-		slog.Error("validate mirror error", slog.Any("error", validateErr))
-		return nil, fmt.Errorf("invalid mirror: %w", validateErr)
+
+	// For resync, we validate the mirror before dropping it and getting to this step.
+	// There is no point validating again here if it's a resync - the mirror is dropped already
+	if !cfg.Resync {
+		_, validateErr := h.ValidateCDCMirror(ctx, req)
+		if validateErr != nil {
+			slog.Error("validate mirror error", slog.Any("error", validateErr))
+			return nil, fmt.Errorf("invalid mirror: %w", validateErr)
+		}
 	}
 
 	workflowID := fmt.Sprintf("%s-peerflow-%s", cfg.FlowJobName, uuid.New())
@@ -176,9 +181,22 @@ func (h *FlowRequestHandler) removeFlowEntryInCatalog(
 	ctx context.Context,
 	flowName string,
 ) error {
-	_, err := h.pool.Exec(ctx, "DELETE FROM flows WHERE name=$1", flowName)
+	tx, err := h.pool.Begin(ctx)
 	if err != nil {
+		return fmt.Errorf("unable to begin tx to remove flow entry in catalog: %w", err)
+	}
+	defer shared.RollbackTx(tx, slog.Default())
+
+	if _, err := tx.Exec(ctx, "DELETE FROM table_schema_mapping WHERE flow_name=$1", flowName); err != nil {
+		return fmt.Errorf("unable to clear table_schema_mapping to remove flow entry in catalog: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, "DELETE FROM flows WHERE name=$1", flowName); err != nil {
 		return fmt.Errorf("unable to remove flow entry in catalog: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("unable to commit remove flow entry in catalog: %w", err)
 	}
 
 	return nil
@@ -218,6 +236,8 @@ func (h *FlowRequestHandler) CreateQRepFlow(
 		cfg.SyncedAtColName = "_PEERDB_SYNCED_AT"
 	}
 
+	cfg.ParentMirrorName = cfg.FlowJobName
+
 	if _, err := h.temporalClient.ExecuteWorkflow(ctx, workflowOptions, workflowFn, cfg, nil); err != nil {
 		slog.Error("unable to start QRepFlow workflow",
 			slog.Any("error", err), slog.String("flowName", cfg.FlowJobName))
@@ -240,10 +260,7 @@ func (h *FlowRequestHandler) updateQRepConfigInCatalog(
 	ctx context.Context,
 	cfg *protos.QRepConfig,
 ) error {
-	var cfgBytes []byte
-	var err error
-
-	cfgBytes, err = proto.Marshal(cfg)
+	cfgBytes, err := proto.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("unable to marshal qrep config: %w", err)
 	}
@@ -261,6 +278,7 @@ func (h *FlowRequestHandler) updateQRepConfigInCatalog(
 func (h *FlowRequestHandler) shutdownFlow(
 	ctx context.Context,
 	flowJobName string,
+	deleteStats bool,
 ) error {
 	workflowID, err := h.getWorkflowID(ctx, flowJobName)
 	if err != nil {
@@ -302,6 +320,7 @@ func (h *FlowRequestHandler) shutdownFlow(
 				FlowJobName:         flowJobName,
 				SourcePeerName:      cdcConfig.SourceName,
 				DestinationPeerName: cdcConfig.DestinationName,
+				DropFlowStats:       deleteStats,
 			})
 		if err != nil {
 			slog.Error("unable to start DropFlow workflow",
@@ -328,16 +347,14 @@ func (h *FlowRequestHandler) shutdownFlow(
 				return fmt.Errorf("DropFlow workflow did not execute successfully: %w", err)
 			}
 		case <-time.After(5 * time.Minute):
-			err := h.handleCancelWorkflow(ctx, workflowID, "")
-			if err != nil {
+			if err := h.handleCancelWorkflow(ctx, workflowID, ""); err != nil {
 				slog.Error("unable to wait for DropFlow workflow to close", logs, slog.Any("error", err))
 				return fmt.Errorf("unable to wait for DropFlow workflow to close: %w", err)
 			}
 		}
 	}
 
-	err = h.removeFlowEntryInCatalog(ctx, flowJobName)
-	if err != nil {
+	if err := h.removeFlowEntryInCatalog(ctx, flowJobName); err != nil {
 		slog.Error("unable to remove flow job entry",
 			slog.String(string(shared.FlowNameKey), flowJobName),
 			slog.Any("error", err),
@@ -402,7 +419,7 @@ func (h *FlowRequestHandler) FlowStateChange(
 		} else if req.RequestedFlowState == protos.FlowStatus_STATUS_TERMINATED &&
 			(currState != protos.FlowStatus_STATUS_TERMINATED) {
 			slog.Info("[flow-state-change]: received drop mirror request")
-			err = h.shutdownFlow(ctx, req.FlowJobName)
+			err = h.shutdownFlow(ctx, req.FlowJobName, req.DropMirrorStats)
 		} else if req.RequestedFlowState != currState {
 			slog.Error("illegal state change requested", slog.Any("requestedFlowState", req.RequestedFlowState),
 				slog.Any("currState", currState))
@@ -415,9 +432,7 @@ func (h *FlowRequestHandler) FlowStateChange(
 		}
 	}
 
-	return &protos.FlowStateChangeResponse{
-		Ok: true,
-	}, nil
+	return &protos.FlowStateChangeResponse{}, nil
 }
 
 func (h *FlowRequestHandler) handleCancelWorkflow(ctx context.Context, workflowID, runID string) error {
@@ -477,19 +492,13 @@ func (h *FlowRequestHandler) DropPeer(
 	req *protos.DropPeerRequest,
 ) (*protos.DropPeerResponse, error) {
 	if req.PeerName == "" {
-		return &protos.DropPeerResponse{
-			Ok:           false,
-			ErrorMessage: fmt.Sprintf("Peer %s not found", req.PeerName),
-		}, fmt.Errorf("peer %s not found", req.PeerName)
+		return nil, fmt.Errorf("peer %s not found", req.PeerName)
 	}
 
 	// Check if peer name is in flows table
 	peerID, _, err := h.getPeerID(ctx, req.PeerName)
 	if err != nil {
-		return &protos.DropPeerResponse{
-			Ok:           false,
-			ErrorMessage: fmt.Sprintf("Failed to obtain peer ID for peer %s: %v", req.PeerName, err),
-		}, fmt.Errorf("failed to obtain peer ID for peer %s: %v", req.PeerName, err)
+		return nil, fmt.Errorf("failed to obtain peer ID for peer %s: %w", req.PeerName, err)
 	}
 
 	var inMirror pgtype.Int8
@@ -497,30 +506,19 @@ func (h *FlowRequestHandler) DropPeer(
 		"SELECT COUNT(*) FROM flows WHERE source_peer=$1 or destination_peer=$2",
 		peerID, peerID).Scan(&inMirror)
 	if queryErr != nil {
-		return &protos.DropPeerResponse{
-			Ok:           false,
-			ErrorMessage: fmt.Sprintf("Failed to check for existing mirrors with peer %s: %v", req.PeerName, queryErr),
-		}, fmt.Errorf("failed to check for existing mirrors with peer %s", req.PeerName)
+		return nil, fmt.Errorf("failed to check for existing mirrors with peer %s: %w", req.PeerName, queryErr)
 	}
 
 	if inMirror.Int64 != 0 {
-		return &protos.DropPeerResponse{
-			Ok:           false,
-			ErrorMessage: fmt.Sprintf("Peer %s is currently involved in an ongoing mirror.", req.PeerName),
-		}, nil
+		return nil, fmt.Errorf("peer %s is currently involved in an ongoing mirror", req.PeerName)
 	}
 
 	_, delErr := h.pool.Exec(ctx, "DELETE FROM peers WHERE name = $1", req.PeerName)
 	if delErr != nil {
-		return &protos.DropPeerResponse{
-			Ok:           false,
-			ErrorMessage: fmt.Sprintf("failed to delete peer %s from metadata table: %v", req.PeerName, delErr),
-		}, fmt.Errorf("failed to delete peer %s from metadata table: %v", req.PeerName, delErr)
+		return nil, fmt.Errorf("failed to delete peer %s from metadata table: %w", req.PeerName, delErr)
 	}
 
-	return &protos.DropPeerResponse{
-		Ok: true,
-	}, nil
+	return &protos.DropPeerResponse{}, nil
 }
 
 func (h *FlowRequestHandler) getWorkflowID(ctx context.Context, flowJobName string) (string, error) {
@@ -552,12 +550,20 @@ func (h *FlowRequestHandler) ResyncMirror(
 		return nil, err
 	}
 
-	err = h.shutdownFlow(ctx, req.FlowJobName)
+	config.Resync = true
+	config.DoInitialSnapshot = true
+	// validate mirror first because once the mirror is dropped, there's no going back
+	_, err = h.ValidateCDCMirror(ctx, &protos.CreateCDCFlowRequest{
+		ConnectionConfigs: config,
+	})
 	if err != nil {
 		return nil, err
 	}
-	config.Resync = true
-	config.DoInitialSnapshot = true
+
+	err = h.shutdownFlow(ctx, req.FlowJobName, req.DropStats)
+	if err != nil {
+		return nil, err
+	}
 
 	_, err = h.CreateCDCFlow(ctx, &protos.CreateCDCFlowRequest{
 		ConnectionConfigs: config,
@@ -565,7 +571,5 @@ func (h *FlowRequestHandler) ResyncMirror(
 	if err != nil {
 		return nil, err
 	}
-	return &protos.ResyncMirrorResponse{
-		Ok: true,
-	}, nil
+	return &protos.ResyncMirrorResponse{}, nil
 }
